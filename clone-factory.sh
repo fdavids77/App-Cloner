@@ -1,8 +1,11 @@
 #!/bin/bash
 # ============================================================
-#  APK Clone Factory v1.0
+#  APK Clone Factory v1.1
 #  Universal multi-clone builder for split APKs (XAPK)
 #  Tested: WhatsApp, Tinder
+#
+#  v1.1: Fresh decompile per clone — fixes APKEditor
+#        resource contamination across builds
 # ============================================================
 set -e
 
@@ -18,7 +21,7 @@ C='\033[0;36m'; B='\033[1m'; N='\033[0m'
 
 # ---- USAGE -------------------------------------------------
 usage() {
-  echo -e "${B}APK Clone Factory${N}"
+  echo -e "${B}APK Clone Factory v1.1${N}"
   echo ""
   echo "Usage: $0 <xapk_file> <num_clones> [--install] [--private-space]"
   echo ""
@@ -55,6 +58,12 @@ done
 [[ "$NUM_CLONES" =~ ^[0-9]+$ ]] || { echo -e "${R}num_clones must be a number${N}"; exit 1; }
 [ "$NUM_CLONES" -lt 1 ] || [ "$NUM_CLONES" -gt 10 ] && echo -e "${R}num_clones must be 1-10${N}" && exit 1
 
+# ---- HELPERS -----------------------------------------------
+log() { echo -e "${G}[*]${N} $1"; }
+warn() { echo -e "${Y}[!]${N} $1"; }
+err() { echo -e "${R}[✗]${N} $1"; exit 1; }
+ok() { echo -e "${G}[✓]${N} $1"; }
+
 # ---- PATHS -------------------------------------------------
 WORK_DIR="$(cd "$(dirname "$XAPK_FILE")" && pwd)"
 XAPK_FILE="$(cd "$(dirname "$XAPK_FILE")" && pwd)/$(basename "$XAPK_FILE")"
@@ -69,19 +78,12 @@ done
 
 echo -e "${C}Using APKEditor: $APKEDITOR${N}"
 
-# ---- DETECT APP --------------------------------------------
-log() { echo -e "${G}[*]${N} $1"; }
-warn() { echo -e "${Y}[!]${N} $1"; }
-err() { echo -e "${R}[✗]${N} $1"; exit 1; }
-ok() { echo -e "${G}[✓]${N} $1"; }
-
 # ---- STEP 1: UNZIP XAPK ------------------------------------
 SPLITS_DIR="$WORK_DIR/_splits"
-DECOMPILED="$WORK_DIR/_decompiled"
 MERGED_APK="$WORK_DIR/_merged.apk"
 OUTPUT_DIR="$WORK_DIR/output"
 
-rm -rf "$SPLITS_DIR" "$DECOMPILED" "$MERGED_APK"
+rm -rf "$SPLITS_DIR" "$MERGED_APK"
 mkdir -p "$SPLITS_DIR" "$OUTPUT_DIR"
 
 log "Extracting XAPK..."
@@ -125,42 +127,9 @@ echo ""
 # ---- STEP 2: MERGE -----------------------------------------
 log "Merging split APKs..."
 java -jar "$APKEDITOR" m -i "$SPLITS_DIR" -o "$MERGED_APK"
-ok "Merged"
+ok "Merged → $(du -h "$MERGED_APK" | cut -f1)"
 
-# ---- STEP 3: DECOMPILE -------------------------------------
-log "Decompiling..."
-rm -rf "$DECOMPILED"
-java -jar "$APKEDITOR" d -i "$MERGED_APK" -o "$DECOMPILED"
-ok "Decompiled"
-
-# ---- STEP 4: FIND SMALI DIR --------------------------------
-SMALI_DIR=""
-if [ -d "$DECOMPILED/smali" ]; then
-  SMALI_DIR="$DECOMPILED/smali"
-elif [ -d "$DECOMPILED/root/smali" ]; then
-  SMALI_DIR="$DECOMPILED/root/smali"
-fi
-
-# ---- STEP 5: DETECT APP-SPECIFIC PATCHES -------------------
-# SecurePendingIntent (WhatsApp and others)
-SECURE_PENDING_FILES=()
-if [ -n "$SMALI_DIR" ]; then
-  while IFS= read -r line; do
-    SECURE_PENDING_FILES+=("$line")
-  done < <(grep -rln 'SecurePendingIntent' "$SMALI_DIR/" 2>/dev/null || true)
-fi
-
-if [ ${#SECURE_PENDING_FILES[@]} -gt 0 ]; then
-  warn "SecurePendingIntent found in ${#SECURE_PENDING_FILES[@]} file(s) — will patch"
-fi
-
-# Backup original manifest + smali
-cp "$DECOMPILED/AndroidManifest.xml" "$DECOMPILED/AndroidManifest.xml.bak"
-for sf in "${SECURE_PENDING_FILES[@]}"; do
-  cp "$sf" "${sf}.bak"
-done
-
-# ---- STEP 6: GENERATE KEYSTORE -----------------------------
+# ---- STEP 3: GENERATE KEYSTORE -----------------------------
 if [ ! -f "$KEYSTORE" ]; then
   log "Generating signing keystore..."
   keytool -genkey -v -keystore "$KEYSTORE" \
@@ -170,81 +139,91 @@ if [ ! -f "$KEYSTORE" ]; then
   ok "Keystore created"
 fi
 
-# ---- STEP 7: BUILD CLONES ----------------------------------
-ESCAPED_PKG=$(echo "$ORIG_PKG" | sed 's/\./\\./g')
-
+# ---- STEP 4: BUILD EACH CLONE (fresh decompile per clone) ---
 for i in $(seq 1 "$NUM_CLONES"); do
   CLONE_ID="clone${i}"
   CLONE_PKG="${ORIG_PKG}.${CLONE_ID}"
   CLONE_APK="$OUTPUT_DIR/${APP_NAME,,}-${CLONE_ID}.apk"
+  DECOMPILED="$WORK_DIR/_decompiled_${CLONE_ID}"
 
   echo ""
-  echo -e "${B}------------------------------------------${N}"
+  echo -e "${B}===========================================${N}"
   echo -e "${C}  Building: $CLONE_PKG ($i/$NUM_CLONES)${N}"
-  echo -e "${B}------------------------------------------${N}"
+  echo -e "${B}===========================================${N}"
 
-  # Restore clean manifest
-  cp "$DECOMPILED/AndroidManifest.xml.bak" "$DECOMPILED/AndroidManifest.xml"
+  # ---- FRESH DECOMPILE from merged APK ----
+  rm -rf "$DECOMPILED"
+  log "Decompiling (fresh for clone${i})..."
+  java -jar "$APKEDITOR" d -i "$MERGED_APK" -o "$DECOMPILED"
+  ok "Decompiled"
 
-  # Restore smali backups
-  for sf in "${SECURE_PENDING_FILES[@]}"; do
-    cp "${sf}.bak" "$sf"
-  done
+  # ---- FIND SMALI DIR ----
+  SMALI_DIR=""
+  if [ -d "$DECOMPILED/smali" ]; then
+    SMALI_DIR="$DECOMPILED/smali"
+  elif [ -d "$DECOMPILED/root/smali" ]; then
+    SMALI_DIR="$DECOMPILED/root/smali"
+  fi
 
-  # --- MANIFEST PATCHES ---
+  # ---- MANIFEST PATCHES ----
 
   # 1) Package name
   sed -i "s|package=\"${ORIG_PKG}\"|package=\"${CLONE_PKG}\"|" "$DECOMPILED/AndroidManifest.xml"
 
-  # 2) Authorities (com.tinder.X → com.tinder.clone1.X)
+  # 2) Authorities
   sed -i "s|android:authorities=\"${ORIG_PKG}\.|android:authorities=\"${CLONE_PKG}.|g" "$DECOMPILED/AndroidManifest.xml"
-  # Also catch authorities that are exactly the package name (no suffix)
   sed -i "s|android:authorities=\"${ORIG_PKG}\"|android:authorities=\"${CLONE_PKG}\"|g" "$DECOMPILED/AndroidManifest.xml"
 
   # 3) Custom permissions
   sed -i "s|${ORIG_PKG}\.permission\.|${CLONE_PKG}.permission.|g" "$DECOMPILED/AndroidManifest.xml"
   sed -i "s|${ORIG_PKG}\.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION|${CLONE_PKG}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION|g" "$DECOMPILED/AndroidManifest.xml"
 
-  # 4) extractNativeLibs=true
+  # 4) Catch-all for any other custom permissions
+  sed -i "s|android:name=\"${ORIG_PKG}\.\([A-Z_]*PERMISSION[A-Z_]*\)\"|android:name=\"${CLONE_PKG}.\1\"|g" "$DECOMPILED/AndroidManifest.xml"
+
+  # 5) extractNativeLibs=true
   sed -i 's|android:extractNativeLibs="false"|android:extractNativeLibs="true"|' "$DECOMPILED/AndroidManifest.xml"
 
-  # 5) Samsung multiwindow cleanup
+  # 6) Samsung multiwindow cleanup
   sed -i '/<package android:name="com.samsung.android.mapsagent"/d' "$DECOMPILED/AndroidManifest.xml"
   sed -i '/com\.samsung\.android\.mapsagent\.permission\.READ_APP_INFO/d' "$DECOMPILED/AndroidManifest.xml"
 
-  # 6) Any other custom permissions matching original package (catch-all)
-  sed -i "s|android:name=\"${ORIG_PKG}\.\([A-Z_]*PERMISSION[A-Z_]*\)\"|android:name=\"${CLONE_PKG}.\1\"|g" "$DECOMPILED/AndroidManifest.xml"
-
   ok "Manifest patched"
 
-  # --- SMALI PATCHES ---
+  # ---- SMALI PATCHES ----
 
-  # SecurePendingIntent: replace throw with return-void
-  for sf in "${SECURE_PENDING_FILES[@]}"; do
-    if grep -q 'throw ' "$sf"; then
-      # Find throw instructions near SecurePendingIntent and replace with return-void
-      sed -i '/SecurePendingIntent/{n;s/throw .*/return-void/}' "$sf"
-      # Also handle cases where throw is a few lines after
-      python3 -c "
+  # SecurePendingIntent: detect and patch throw → return-void
+  if [ -n "$SMALI_DIR" ]; then
+    SECURE_FILES=$(grep -rln 'SecurePendingIntent' "$SMALI_DIR/" 2>/dev/null || true)
+    if [ -n "$SECURE_FILES" ]; then
+      while IFS= read -r sf; do
+        if grep -q 'throw ' "$sf"; then
+          python3 -c "
 import re
 with open('$sf', 'r') as f:
     content = f.read()
-# Pattern: find 'throw vX' after invoke.*SecurePendingIntent within ~10 lines
-content = re.sub(r'(invoke[^\n]*SecurePendingIntent[^\n]*\n(?:[^\n]*\n){0,10}?[^\n]*)throw (v\d+)', r'\1return-void #patched \2', content)
+content = re.sub(
+    r'(invoke[^\n]*SecurePendingIntent[^\n]*\n(?:[^\n]*\n){0,10}?[^\n]*)throw (v\d+)',
+    r'\1return-void #patched \2',
+    content
+)
 with open('$sf', 'w') as f:
     f.write(content)
 " 2>/dev/null || true
-      ok "SecurePendingIntent patched in $(basename "$sf")"
+          ok "SecurePendingIntent patched in $(basename "$sf")"
+        fi
+      done <<< "$SECURE_FILES"
     fi
-  done
+  fi
 
-  # --- REBUILD ---
+  # ---- REBUILD ----
   log "Rebuilding APK..."
   UNSIGNED="$WORK_DIR/_${CLONE_ID}-unsigned.apk"
   rm -f "$UNSIGNED"
   java -jar "$APKEDITOR" b -i "$DECOMPILED" -o "$UNSIGNED"
+  ok "Built"
 
-  # --- UNCOMPRESSED .so INJECTION ---
+  # ---- UNCOMPRESSED .so INJECTION ----
   log "Injecting uncompressed .so files..."
   TMPSO=$(mktemp -d)
   unzip -o "$UNSIGNED" 'lib/*' -d "$TMPSO" 2>/dev/null || true
@@ -256,16 +235,16 @@ with open('$sf', 'w') as f:
   rm -rf "$TMPSO"
   ok ".so files injected"
 
-  # --- SIGN ---
+  # ---- SIGN ----
   log "Signing..."
   apksigner sign --ks "$KEYSTORE" --ks-pass "pass:${KS_PASS}" \
     --ks-key-alias "$KS_ALIAS" "$UNSIGNED" 2>/dev/null
   mv "$UNSIGNED" "$CLONE_APK"
-  ok "Signed → $(basename "$CLONE_APK")"
+  ok "Signed → $(basename "$CLONE_APK") ($(du -h "$CLONE_APK" | cut -f1))"
 
-  # --- INSTALL ---
+  # ---- INSTALL ----
   if $DO_INSTALL; then
-    log "Installing..."
+    log "Installing $CLONE_PKG..."
     if $PRIVATE_SPACE; then
       adb push "$CLONE_APK" /data/local/tmp/_clone.apk
       adb shell su -c "pm install --user 10 /data/local/tmp/_clone.apk" && ok "Installed to Private Space" || warn "Install failed"
@@ -275,14 +254,14 @@ with open('$sf', 'w') as f:
     fi
   fi
 
+  # ---- CLEANUP decompiled dir ----
+  rm -rf "$DECOMPILED"
+
 done
 
-# ---- CLEANUP ------------------------------------------------
-cp "$DECOMPILED/AndroidManifest.xml.bak" "$DECOMPILED/AndroidManifest.xml"
-for sf in "${SECURE_PENDING_FILES[@]}"; do
-  cp "${sf}.bak" "$sf"
-done
+# ---- FINAL CLEANUP ------------------------------------------
 rm -f "$MERGED_APK"
+rm -rf "$SPLITS_DIR"
 
 echo ""
 echo -e "${B}========================================${N}"
@@ -290,14 +269,12 @@ echo -e "${G}  Build complete!${N}"
 echo -e "${B}========================================${N}"
 echo ""
 echo -e "  ${B}Clones:${N}"
-ls -lh "$OUTPUT_DIR/"*.apk 2>/dev/null | while read -r line; do
-  echo -e "    $line"
-done
+ls -lh "$OUTPUT_DIR/"*.apk 2>/dev/null | awk '{print "    " $5 "  " $NF}'
 echo ""
 echo -e "  ${B}Manual install:${N}"
-echo -e "    adb install output/<name>.apk"
+echo -e "    adb install output/${APP_NAME,,}-cloneN.apk"
 echo ""
 echo -e "  ${B}Private Space:${N}"
-echo -e "    adb push output/<name>.apk /data/local/tmp/c.apk"
+echo -e "    adb push output/${APP_NAME,,}-cloneN.apk /data/local/tmp/c.apk"
 echo -e "    adb shell su -c 'pm install --user 10 /data/local/tmp/c.apk'"
 echo ""
