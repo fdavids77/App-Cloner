@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
-#  APK Clone Factory v1.3
+#  APK Clone Factory v1.4
 #  Universal multi-clone builder for split APKs (XAPK/APKM)
 #  Tested: WhatsApp, Tinder
 #
-#  v1.3: Uses apktool for decompile/rebuild (proven stable),
-#        APKEditor for merge only. Matches working
-#        whatsapp-clone-builder approach.
+#  v1.3: apktool for decompile/rebuild, APKEditor for merge
+#  v1.4: --start N and --count N flags for building specific
+#        clone ranges (e.g. --start 8 --count 3 → clone8-10)
 # ============================================================
 set -e
 
@@ -22,19 +22,24 @@ C='\033[0;36m'; B='\033[1m'; N='\033[0m'
 
 # ---- USAGE -------------------------------------------------
 usage() {
-  echo -e "${B}APK Clone Factory v1.3${N}"
+  echo -e "${B}APK Clone Factory v1.4${N}"
   echo ""
-  echo "Usage: $0 <xapk_file> <num_clones> [--install] [--private-space]"
+  echo "Usage: $0 <input_file> <count> [options]"
   echo ""
-  echo "  <xapk_file>       Path to .xapk, .apkm, or .apk file"
-  echo "  <num_clones>      Number of clones to build (1-10)"
+  echo "  <input_file>      Path to .xapk, .apkm, or .apk (pre-merged) file"
+  echo "  <count>           Number of clones to build (1-20)"
+  echo ""
+  echo "Options:"
+  echo "  --start N          Start numbering at N (default: 1)"
+  echo "                     e.g. --start 8 with count 3 → clone8, clone9, clone10"
   echo "  --install          ADB install each clone after building"
   echo "  --private-space    Install to Private Space (user 10, requires root)"
   echo ""
   echo "Examples:"
-  echo "  $0 whatsapp.xapk 3"
-  echo "  $0 tinder.xapk 2 --install"
-  echo "  $0 whatsapp.apkm 4 --install --private-space"
+  echo "  $0 whatsapp.xapk 3                          # clone1, clone2, clone3"
+  echo "  $0 WhatsApp_merged.apk 3 --start 8          # clone8, clone9, clone10"
+  echo "  $0 tinder.xapk 2 --install                  # clone1, clone2 + install"
+  echo "  $0 whatsapp.apkm 4 --start 5 --private-space"
   exit 1
 }
 
@@ -42,12 +47,17 @@ usage() {
 [ $# -lt 2 ] && usage
 XAPK_FILE="$1"
 NUM_CLONES="$2"
+START_NUM=1
 DO_INSTALL=false
 PRIVATE_SPACE=false
 
 shift 2
 while [ $# -gt 0 ]; do
   case "$1" in
+    --start)
+      shift
+      START_NUM="$1"
+      ;;
     --install) DO_INSTALL=true ;;
     --private-space) PRIVATE_SPACE=true; DO_INSTALL=true ;;
     *) echo -e "${R}Unknown arg: $1${N}"; usage ;;
@@ -56,8 +66,12 @@ while [ $# -gt 0 ]; do
 done
 
 [ ! -f "$XAPK_FILE" ] && echo -e "${R}File not found: $XAPK_FILE${N}" && exit 1
-[[ "$NUM_CLONES" =~ ^[0-9]+$ ]] || { echo -e "${R}num_clones must be a number${N}"; exit 1; }
-[ "$NUM_CLONES" -lt 1 ] || [ "$NUM_CLONES" -gt 10 ] && echo -e "${R}num_clones must be 1-10${N}" && exit 1
+[[ "$NUM_CLONES" =~ ^[0-9]+$ ]] || { echo -e "${R}count must be a number${N}"; exit 1; }
+[[ "$START_NUM" =~ ^[0-9]+$ ]] || { echo -e "${R}--start must be a number${N}"; exit 1; }
+[ "$NUM_CLONES" -lt 1 ] || [ "$NUM_CLONES" -gt 20 ] && echo -e "${R}count must be 1-20${N}" && exit 1
+[ "$START_NUM" -lt 1 ] && echo -e "${R}--start must be >= 1${N}" && exit 1
+
+END_NUM=$(( START_NUM + NUM_CLONES - 1 ))
 
 # ---- HELPERS -----------------------------------------------
 log() { echo -e "${G}[*]${N} $1"; }
@@ -71,7 +85,7 @@ check_dep() {
 }
 
 check_dep java || exit 1
-check_dep apktool || err "apktool not found. Install: sudo apt install apktool, or see prepare.sh"
+check_dep apktool || err "apktool not found. Install: sudo apt install apktool"
 check_dep apksigner || err "apksigner not found. Install: sudo apt install apksigner"
 check_dep zipalign || err "zipalign not found. Install: sudo apt install zipalign"
 
@@ -80,14 +94,11 @@ WORK_DIR="$(cd "$(dirname "$XAPK_FILE")" && pwd)"
 XAPK_FILE="$(cd "$(dirname "$XAPK_FILE")" && pwd)/$(basename "$XAPK_FILE")"
 KEYSTORE="$WORK_DIR/$KEYSTORE_NAME"
 
-# Find APKEditor.jar
+# Find APKEditor.jar (only needed for split APKs)
 APKEDITOR=""
 for p in "$WORK_DIR/APKEditor.jar" "$HOME/APKEditor.jar" "$HOME/tools/APKEditor.jar"; do
   [ -f "$p" ] && APKEDITOR="$p" && break
 done
-
-echo -e "${C}APKEditor: ${APKEDITOR:-not found (merge step will fail for split APKs)}${N}"
-echo -e "${C}apktool:   $(which apktool)${N}"
 
 # ---- STEP 1: HANDLE INPUT ----------------------------------
 BUNDLE_DIR="$WORK_DIR/_bundle"
@@ -98,12 +109,13 @@ rm -rf "$BUNDLE_DIR" "$MERGED_APK"
 mkdir -p "$BUNDLE_DIR" "$OUTPUT_DIR"
 
 INPUT_EXT="${XAPK_FILE##*.}"
+NEEDS_MERGE=false
 
 if [ "$INPUT_EXT" = "xapk" ]; then
+  NEEDS_MERGE=true
   log "Extracting XAPK..."
   unzip -q -o "$XAPK_FILE" -d "$BUNDLE_DIR"
 
-  # Detect package name from manifest.json
   ORIG_PKG=""
   if [ -f "$BUNDLE_DIR/manifest.json" ]; then
     ORIG_PKG=$(grep -o '"package_name"[[:space:]]*:[[:space:]]*"[^"]*"' "$BUNDLE_DIR/manifest.json" | head -1 | grep -o '"[^"]*"$' | tr -d '"')
@@ -115,42 +127,40 @@ if [ "$INPUT_EXT" = "xapk" ]; then
     done
   fi
 
-  [ -z "$APKEDITOR" ] && err "APKEditor.jar needed for XAPK merge but not found"
-  log "Merging split APKs..."
-  java -jar "$APKEDITOR" m -i "$BUNDLE_DIR" -o "$MERGED_APK"
-  ok "Merged → $(du -h "$MERGED_APK" | cut -f1)"
-
 elif [ "$INPUT_EXT" = "apkm" ]; then
+  NEEDS_MERGE=true
   log "Extracting APKM..."
   cp "$XAPK_FILE" "$BUNDLE_DIR/bundle.zip"
   cd "$BUNDLE_DIR" && unzip -q bundle.zip && cd "$WORK_DIR"
 
-  # Detect package from filenames
   ORIG_PKG=""
   for f in "$BUNDLE_DIR"/*.apk; do
     base=$(basename "$f" .apk)
     [[ "$base" == com.* ]] && ORIG_PKG="$base" && break
   done
 
-  [ -z "$APKEDITOR" ] && err "APKEditor.jar needed for APKM merge but not found"
-  log "Merging split APKs..."
-  java -jar "$APKEDITOR" m -i "$BUNDLE_DIR" -o "$MERGED_APK"
-  ok "Merged → $(du -h "$MERGED_APK" | cut -f1)"
-
 elif [ "$INPUT_EXT" = "apk" ]; then
   cp "$XAPK_FILE" "$MERGED_APK"
-  ok "Using APK directly → $(du -h "$MERGED_APK" | cut -f1)"
   ORIG_PKG=""
+  ok "Using pre-merged APK → $(du -h "$MERGED_APK" | cut -f1)"
+
 else
   err "Unsupported file type: .$INPUT_EXT (use .xapk, .apkm, or .apk)"
 fi
 
-# Detect package from merged APK via aapt if not found yet
+# Merge if needed
+if $NEEDS_MERGE; then
+  [ -z "$APKEDITOR" ] && err "APKEditor.jar needed for merge but not found"
+  log "Merging split APKs..."
+  java -jar "$APKEDITOR" m -i "$BUNDLE_DIR" -o "$MERGED_APK"
+  ok "Merged → $(du -h "$MERGED_APK" | cut -f1)"
+fi
+
+# Detect package from merged APK if not found yet
 if [ -z "$ORIG_PKG" ]; then
   ORIG_PKG=$(aapt dump badging "$MERGED_APK" 2>/dev/null | grep -o "package: name='[^']*'" | grep -o "'[^']*'" | tr -d "'" || true)
 fi
 if [ -z "$ORIG_PKG" ]; then
-  # Fallback: decompile just the manifest
   TMPD=$(mktemp -d)
   apktool d "$MERGED_APK" -o "$TMPD" -s --force 2>/dev/null
   ORIG_PKG=$(grep -o 'package="[^"]*"' "$TMPD/AndroidManifest.xml" 2>/dev/null | head -1 | grep -o '"[^"]*"' | tr -d '"')
@@ -171,7 +181,7 @@ echo ""
 echo -e "${B}========================================${N}"
 echo -e "${B}  App:     ${C}$APP_NAME${N}"
 echo -e "${B}  Package: ${C}$ORIG_PKG${N}"
-echo -e "${B}  Clones:  ${C}$NUM_CLONES${N}"
+echo -e "${B}  Clones:  ${C}clone${START_NUM} → clone${END_NUM} (${NUM_CLONES} total)${N}"
 echo -e "${B}========================================${N}"
 echo ""
 
@@ -186,7 +196,7 @@ if [ ! -f "$KEYSTORE" ]; then
 fi
 
 # ---- STEP 3: BUILD EACH CLONE ------------------------------
-for i in $(seq 1 "$NUM_CLONES"); do
+for i in $(seq "$START_NUM" "$END_NUM"); do
   CLONE_ID="clone${i}"
   CLONE_PKG="${ORIG_PKG}.${CLONE_ID}"
   CLONE_APK="$OUTPUT_DIR/${APP_NAME,,}-${CLONE_ID}.apk"
@@ -196,7 +206,7 @@ for i in $(seq 1 "$NUM_CLONES"); do
 
   echo ""
   echo -e "${B}===========================================${N}"
-  echo -e "${C}  Building: $CLONE_PKG ($i/$NUM_CLONES)${N}"
+  echo -e "${C}  Building: $CLONE_PKG (clone${i}, $((i - START_NUM + 1))/${NUM_CLONES})${N}"
   echo -e "${B}===========================================${N}"
 
   # ---- FRESH DECOMPILE via apktool ----
@@ -300,18 +310,15 @@ PYEOF
 
   # ---- FIX NATIVE LIB COMPRESSION ----
   log "Fixing native lib compression..."
-  # Remove compressed .so files, re-add uncompressed
-  zip -d "$UNSIGNED" 'lib/arm64-v8a/*.so' 2>/dev/null || true
-  zip -d "$UNSIGNED" 'lib/armeabi-v7a/*.so' 2>/dev/null || true
-  if [ -d "$DECOMPILED/lib/arm64-v8a" ]; then
-    cd "$DECOMPILED"
-    find lib/arm64-v8a/ -name "*.so" | xargs zip -0 "$UNSIGNED"
-    cd "$WORK_DIR"
-  elif [ -d "$DECOMPILED/lib/armeabi-v7a" ]; then
-    cd "$DECOMPILED"
-    find lib/armeabi-v7a/ -name "*.so" | xargs zip -0 "$UNSIGNED"
-    cd "$WORK_DIR"
-  fi
+  # Detect which ABI dirs exist
+  for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+    if [ -d "$DECOMPILED/lib/$abi" ]; then
+      zip -d "$UNSIGNED" "lib/${abi}/*.so" 2>/dev/null || true
+      cd "$DECOMPILED"
+      find "lib/${abi}/" -name "*.so" | xargs zip -0 "$UNSIGNED"
+      cd "$WORK_DIR"
+    fi
+  done
   ok ".so files injected uncompressed"
 
   # ---- ALIGN + SIGN ----
@@ -356,8 +363,11 @@ echo -e "${B}========================================${N}"
 echo -e "${G}  Build complete!${N}"
 echo -e "${B}========================================${N}"
 echo ""
-echo -e "  ${B}Clones:${N}"
-ls -lh "$OUTPUT_DIR/"*.apk 2>/dev/null | awk '{print "    " $5 "  " $NF}'
+echo -e "  ${B}Clones built:${N}"
+for i in $(seq "$START_NUM" "$END_NUM"); do
+  f="$OUTPUT_DIR/${APP_NAME,,}-clone${i}.apk"
+  [ -f "$f" ] && echo -e "    $(du -h "$f" | cut -f1)  ${ORIG_PKG}.clone${i}  →  $(basename "$f")"
+done
 echo ""
 echo -e "  ${B}Manual install:${N}"
 echo -e "    adb install output/${APP_NAME,,}-cloneN.apk"
