@@ -1,13 +1,12 @@
 #!/bin/bash
 # ============================================================
-#  APK Clone Factory v1.2
-#  Universal multi-clone builder for split APKs (XAPK)
+#  APK Clone Factory v1.3
+#  Universal multi-clone builder for split APKs (XAPK/APKM)
 #  Tested: WhatsApp, Tinder
 #
-#  v1.1: Fresh decompile per clone
-#  v1.2: Raw dex mode — avoids APKEditor smali compiler bugs.
-#        SecurePendingIntent patched via baksmali/smali on
-#        targeted dex only.
+#  v1.3: Uses apktool for decompile/rebuild (proven stable),
+#        APKEditor for merge only. Matches working
+#        whatsapp-clone-builder approach.
 # ============================================================
 set -e
 
@@ -23,11 +22,11 @@ C='\033[0;36m'; B='\033[1m'; N='\033[0m'
 
 # ---- USAGE -------------------------------------------------
 usage() {
-  echo -e "${B}APK Clone Factory v1.2${N}"
+  echo -e "${B}APK Clone Factory v1.3${N}"
   echo ""
   echo "Usage: $0 <xapk_file> <num_clones> [--install] [--private-space]"
   echo ""
-  echo "  <xapk_file>       Path to .xapk or .apk file"
+  echo "  <xapk_file>       Path to .xapk, .apkm, or .apk file"
   echo "  <num_clones>      Number of clones to build (1-10)"
   echo "  --install          ADB install each clone after building"
   echo "  --private-space    Install to Private Space (user 10, requires root)"
@@ -35,7 +34,7 @@ usage() {
   echo "Examples:"
   echo "  $0 whatsapp.xapk 3"
   echo "  $0 tinder.xapk 2 --install"
-  echo "  $0 whatsapp.xapk 4 --install --private-space"
+  echo "  $0 whatsapp.apkm 4 --install --private-space"
   exit 1
 }
 
@@ -66,6 +65,16 @@ warn() { echo -e "${Y}[!]${N} $1"; }
 err() { echo -e "${R}[✗]${N} $1"; exit 1; }
 ok() { echo -e "${G}[✓]${N} $1"; }
 
+# ---- DEPENDENCY CHECK --------------------------------------
+check_dep() {
+  command -v "$1" &>/dev/null || { echo -e "${R}Missing: $1 — install it first${N}"; return 1; }
+}
+
+check_dep java || exit 1
+check_dep apktool || err "apktool not found. Install: sudo apt install apktool, or see prepare.sh"
+check_dep apksigner || err "apksigner not found. Install: sudo apt install apksigner"
+check_dep zipalign || err "zipalign not found. Install: sudo apt install zipalign"
+
 # ---- PATHS -------------------------------------------------
 WORK_DIR="$(cd "$(dirname "$XAPK_FILE")" && pwd)"
 XAPK_FILE="$(cd "$(dirname "$XAPK_FILE")" && pwd)/$(basename "$XAPK_FILE")"
@@ -76,64 +85,76 @@ APKEDITOR=""
 for p in "$WORK_DIR/APKEditor.jar" "$HOME/APKEditor.jar" "$HOME/tools/APKEditor.jar"; do
   [ -f "$p" ] && APKEDITOR="$p" && break
 done
-[ -z "$APKEDITOR" ] && err "APKEditor.jar not found in $WORK_DIR, ~/, or ~/tools/"
 
-# Find baksmali.jar and smali.jar (optional, for SecurePendingIntent)
-BAKSMALI=""
-SMALI=""
-for p in "$WORK_DIR/baksmali.jar" "$HOME/baksmali.jar" "$HOME/tools/baksmali.jar"; do
-  [ -f "$p" ] && BAKSMALI="$p" && break
-done
-for p in "$WORK_DIR/smali.jar" "$HOME/smali.jar" "$HOME/tools/smali.jar"; do
-  [ -f "$p" ] && SMALI="$p" && break
-done
+echo -e "${C}APKEditor: ${APKEDITOR:-not found (merge step will fail for split APKs)}${N}"
+echo -e "${C}apktool:   $(which apktool)${N}"
 
-echo -e "${C}APKEditor: $APKEDITOR${N}"
-[ -n "$BAKSMALI" ] && echo -e "${C}baksmali:  $BAKSMALI${N}" || echo -e "${Y}baksmali:  not found (SecurePendingIntent patching unavailable)${N}"
-
-# ---- STEP 1: HANDLE INPUT (XAPK or APK) --------------------
-SPLITS_DIR="$WORK_DIR/_splits"
+# ---- STEP 1: HANDLE INPUT ----------------------------------
+BUNDLE_DIR="$WORK_DIR/_bundle"
 MERGED_APK="$WORK_DIR/_merged.apk"
 OUTPUT_DIR="$WORK_DIR/output"
 
-rm -rf "$SPLITS_DIR" "$MERGED_APK"
-mkdir -p "$SPLITS_DIR" "$OUTPUT_DIR"
+rm -rf "$BUNDLE_DIR" "$MERGED_APK"
+mkdir -p "$BUNDLE_DIR" "$OUTPUT_DIR"
 
 INPUT_EXT="${XAPK_FILE##*.}"
 
 if [ "$INPUT_EXT" = "xapk" ]; then
   log "Extracting XAPK..."
-  unzip -q -o "$XAPK_FILE" -d "$SPLITS_DIR"
+  unzip -q -o "$XAPK_FILE" -d "$BUNDLE_DIR"
 
   # Detect package name from manifest.json
   ORIG_PKG=""
-  if [ -f "$SPLITS_DIR/manifest.json" ]; then
-    ORIG_PKG=$(grep -o '"package_name"[[:space:]]*:[[:space:]]*"[^"]*"' "$SPLITS_DIR/manifest.json" | head -1 | grep -o '"[^"]*"$' | tr -d '"')
+  if [ -f "$BUNDLE_DIR/manifest.json" ]; then
+    ORIG_PKG=$(grep -o '"package_name"[[:space:]]*:[[:space:]]*"[^"]*"' "$BUNDLE_DIR/manifest.json" | head -1 | grep -o '"[^"]*"$' | tr -d '"')
   fi
-
-  # Fallback: detect from base APK filename
   if [ -z "$ORIG_PKG" ]; then
-    for f in "$SPLITS_DIR"/*.apk; do
+    for f in "$BUNDLE_DIR"/*.apk; do
       base=$(basename "$f" .apk)
-      if [[ "$base" == com.* ]]; then
-        ORIG_PKG="$base"
-        break
-      fi
+      [[ "$base" == com.* ]] && ORIG_PKG="$base" && break
     done
   fi
 
-  # Merge splits
+  [ -z "$APKEDITOR" ] && err "APKEditor.jar needed for XAPK merge but not found"
   log "Merging split APKs..."
-  java -jar "$APKEDITOR" m -i "$SPLITS_DIR" -o "$MERGED_APK"
+  java -jar "$APKEDITOR" m -i "$BUNDLE_DIR" -o "$MERGED_APK"
+  ok "Merged → $(du -h "$MERGED_APK" | cut -f1)"
+
+elif [ "$INPUT_EXT" = "apkm" ]; then
+  log "Extracting APKM..."
+  cp "$XAPK_FILE" "$BUNDLE_DIR/bundle.zip"
+  cd "$BUNDLE_DIR" && unzip -q bundle.zip && cd "$WORK_DIR"
+
+  # Detect package from filenames
+  ORIG_PKG=""
+  for f in "$BUNDLE_DIR"/*.apk; do
+    base=$(basename "$f" .apk)
+    [[ "$base" == com.* ]] && ORIG_PKG="$base" && break
+  done
+
+  [ -z "$APKEDITOR" ] && err "APKEditor.jar needed for APKM merge but not found"
+  log "Merging split APKs..."
+  java -jar "$APKEDITOR" m -i "$BUNDLE_DIR" -o "$MERGED_APK"
   ok "Merged → $(du -h "$MERGED_APK" | cut -f1)"
 
 elif [ "$INPUT_EXT" = "apk" ]; then
   cp "$XAPK_FILE" "$MERGED_APK"
-  # Detect package from APK via aapt or APKEditor
-  ORIG_PKG=$(java -jar "$APKEDITOR" info -i "$MERGED_APK" 2>/dev/null | grep -o 'package="[^"]*"' | head -1 | grep -o '"[^"]*"' | tr -d '"' || true)
   ok "Using APK directly → $(du -h "$MERGED_APK" | cut -f1)"
+  ORIG_PKG=""
 else
-  err "Unsupported file type: .$INPUT_EXT (use .xapk or .apk)"
+  err "Unsupported file type: .$INPUT_EXT (use .xapk, .apkm, or .apk)"
+fi
+
+# Detect package from merged APK via aapt if not found yet
+if [ -z "$ORIG_PKG" ]; then
+  ORIG_PKG=$(aapt dump badging "$MERGED_APK" 2>/dev/null | grep -o "package: name='[^']*'" | grep -o "'[^']*'" | tr -d "'" || true)
+fi
+if [ -z "$ORIG_PKG" ]; then
+  # Fallback: decompile just the manifest
+  TMPD=$(mktemp -d)
+  apktool d "$MERGED_APK" -o "$TMPD" -s --force 2>/dev/null
+  ORIG_PKG=$(grep -o 'package="[^"]*"' "$TMPD/AndroidManifest.xml" 2>/dev/null | head -1 | grep -o '"[^"]*"' | tr -d '"')
+  rm -rf "$TMPD"
 fi
 
 [ -z "$ORIG_PKG" ] && err "Could not detect package name"
@@ -169,144 +190,145 @@ for i in $(seq 1 "$NUM_CLONES"); do
   CLONE_ID="clone${i}"
   CLONE_PKG="${ORIG_PKG}.${CLONE_ID}"
   CLONE_APK="$OUTPUT_DIR/${APP_NAME,,}-${CLONE_ID}.apk"
-  DECOMPILED="$WORK_DIR/_decompiled_${CLONE_ID}"
+  DECOMPILED="$WORK_DIR/_dec_${CLONE_ID}"
+  UNSIGNED="$WORK_DIR/_${CLONE_ID}_unsigned.apk"
+  ALIGNED="$WORK_DIR/_${CLONE_ID}_aligned.apk"
 
   echo ""
   echo -e "${B}===========================================${N}"
   echo -e "${C}  Building: $CLONE_PKG ($i/$NUM_CLONES)${N}"
   echo -e "${B}===========================================${N}"
 
-  # ---- FRESH DECOMPILE (raw dex mode) ----
+  # ---- FRESH DECOMPILE via apktool ----
   rm -rf "$DECOMPILED"
-  log "Decompiling (raw mode, fresh for clone${i})..."
-  java -jar "$APKEDITOR" d -t raw -i "$MERGED_APK" -o "$DECOMPILED"
+  log "Decompiling (apktool, fresh for clone${i})..."
+  apktool d "$MERGED_APK" -o "$DECOMPILED" --force
   ok "Decompiled"
+
+  MANIFEST="$DECOMPILED/AndroidManifest.xml"
 
   # ---- MANIFEST PATCHES ----
 
   # 1) Package name
-  sed -i "s|package=\"${ORIG_PKG}\"|package=\"${CLONE_PKG}\"|" "$DECOMPILED/AndroidManifest.xml"
+  sed -i "s|package=\"${ORIG_PKG}\"|package=\"${CLONE_PKG}\"|" "$MANIFEST"
 
   # 2) Authorities
-  sed -i "s|android:authorities=\"${ORIG_PKG}\.|android:authorities=\"${CLONE_PKG}.|g" "$DECOMPILED/AndroidManifest.xml"
-  sed -i "s|android:authorities=\"${ORIG_PKG}\"|android:authorities=\"${CLONE_PKG}\"|g" "$DECOMPILED/AndroidManifest.xml"
+  sed -i "s|android:authorities=\"${ORIG_PKG}\.|android:authorities=\"${CLONE_PKG}.|g" "$MANIFEST"
+  sed -i "s|android:authorities=\"${ORIG_PKG}\"|android:authorities=\"${CLONE_PKG}\"|g" "$MANIFEST"
 
-  # 3) Custom permissions
-  sed -i "s|${ORIG_PKG}\.permission\.|${CLONE_PKG}.permission.|g" "$DECOMPILED/AndroidManifest.xml"
-  sed -i "s|${ORIG_PKG}\.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION|${CLONE_PKG}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION|g" "$DECOMPILED/AndroidManifest.xml"
+  # 3) Delete ALL <permission> declarations (avoids collisions)
+  sed -i '/<permission /d' "$MANIFEST"
 
-  # 4) Catch-all for any other custom permissions
-  sed -i "s|android:name=\"${ORIG_PKG}\.\([A-Z_]*PERMISSION[A-Z_]*\)\"|android:name=\"${CLONE_PKG}.\1\"|g" "$DECOMPILED/AndroidManifest.xml"
+  # 4) Rename permission references in <uses-permission>
+  sed -i "s|${ORIG_PKG}\.permission\.|${CLONE_PKG}.permission.|g" "$MANIFEST"
+  sed -i "s|${ORIG_PKG}\.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION|${CLONE_PKG}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION|g" "$MANIFEST"
 
   # 5) extractNativeLibs=true
-  sed -i 's|android:extractNativeLibs="false"|android:extractNativeLibs="true"|' "$DECOMPILED/AndroidManifest.xml"
+  sed -i 's|android:extractNativeLibs="false"|android:extractNativeLibs="true"|' "$MANIFEST"
 
-  # 6) Samsung multiwindow cleanup
-  sed -i '/<package android:name="com.samsung.android.mapsagent"/d' "$DECOMPILED/AndroidManifest.xml"
-  sed -i '/com\.samsung\.android\.mapsagent\.permission\.READ_APP_INFO/d' "$DECOMPILED/AndroidManifest.xml"
+  # 6) Remove split type attributes (from merged bundles)
+  sed -i 's|android:requiredSplitTypes="[^"]*"||g' "$MANIFEST"
+  sed -i 's|android:splitTypes="[^"]*"||g' "$MANIFEST"
+
+  # 7) Samsung multiwindow cleanup
+  sed -i '/com.sec.android.app.multiwindow/d' "$MANIFEST"
+  sed -i '/<package android:name="com.samsung.android.mapsagent"/d' "$MANIFEST"
+  sed -i '/com\.samsung\.android\.mapsagent\.permission\.READ_APP_INFO/d' "$MANIFEST"
 
   ok "Manifest patched"
 
-  # ---- SECUREPENDINGINTENT PATCH (via baksmali/smali) ----
-  # In raw mode, dex files are at root/classes*.dex
-  # We find which dex has SecurePendingIntent, decompile just that one,
-  # patch it, recompile, and swap it back
-  if [ -n "$BAKSMALI" ] && [ -n "$SMALI" ]; then
-    DEX_DIR="$DECOMPILED/root"
-    [ ! -d "$DEX_DIR" ] && DEX_DIR="$DECOMPILED"
+  # ---- SMALI PATCHES ----
 
-    PATCHED_ANY=false
-    for dex_file in "$DEX_DIR"/classes*.dex; do
-      [ ! -f "$dex_file" ] && continue
+  # SecurePendingIntent (WhatsApp: X/1Dy.smali)
+  SMALI_FILE="$DECOMPILED/smali/X/1Dy.smali"
+  if [ -f "$SMALI_FILE" ]; then
+    log "Patching SecurePendingIntent (X/1Dy.smali)..."
+    python3 << PYEOF
+import sys
+path = '${SMALI_FILE}'
+try:
+    content = open(path).read()
+except FileNotFoundError:
+    print("  Smali file not found - skipping")
+    sys.exit(0)
 
-      # Quick check: does this dex contain SecurePendingIntent?
-      if strings "$dex_file" 2>/dev/null | grep -q 'SecurePendingIntent'; then
-        DEX_NAME=$(basename "$dex_file")
-        SMALI_TMP="$WORK_DIR/_smali_tmp_${CLONE_ID}"
-        rm -rf "$SMALI_TMP"
-
-        log "Patching SecurePendingIntent in $DEX_NAME..."
-
-        # Decompile just this dex
-        java -jar "$BAKSMALI" d "$dex_file" -o "$SMALI_TMP" 2>/dev/null
-
-        # Find and patch throw → return-void
-        SECURE_FILES=$(grep -rln 'SecurePendingIntent' "$SMALI_TMP/" 2>/dev/null || true)
-        if [ -n "$SECURE_FILES" ]; then
-          while IFS= read -r sf; do
-            if grep -q 'throw ' "$sf"; then
-              python3 -c "
-import re
-with open('$sf', 'r') as f:
-    content = f.read()
-content = re.sub(
-    r'(invoke[^\n]*SecurePendingIntent[^\n]*\n(?:[^\n]*\n){0,10}?[^\n]*)throw (v\d+)',
-    r'\1return-void #patched \2',
-    content
-)
-with open('$sf', 'w') as f:
-    f.write(content)
-" 2>/dev/null || true
-              ok "Patched $(basename "$sf")"
-              PATCHED_ANY=true
-            fi
-          done <<< "$SECURE_FILES"
-
-          # Recompile just this dex and swap it back
-          java -jar "$SMALI" a "$SMALI_TMP" -o "$dex_file" 2>/dev/null
-          ok "Recompiled $DEX_NAME"
-        fi
-        rm -rf "$SMALI_TMP"
-      fi
-    done
-
-    if ! $PATCHED_ANY; then
-      log "No SecurePendingIntent found — skipping smali patch"
-    fi
+patches = [
+    (
+        '    if-nez v0, :cond_0\n\n    .line 155\n    .line 156\n    const-string v1, "Please set reporter for SecurePendingIntent library"',
+        '    if-eqz v0, :cond_5\n\n    .line 155\n    .line 156\n    const-string v1, "Please set reporter for SecurePendingIntent library"'
+    ),
+    (
+        '    :cond_8\n    const-string v1, "Please set reporter for SecurePendingIntent library"\n\n    .line 217\n    .line 218\n    new-instance v0, Ljava/lang/IllegalArgumentException;\n\n    .line 219\n    .line 220\n    invoke-direct {v0, v1}, Ljava/lang/IllegalArgumentException;-><init>(Ljava/lang/String;)V\n\n    .line 221\n    .line 222\n    .line 223\n    throw v0',
+        '    :cond_8\n    return-object v2'
+    ),
+    (
+        '    :cond_9\n    const-string v1, "Must generate PendingIntent based on an explicit intent."\n\n    .line 225\n    .line 226\n    new-instance v0, Ljava/lang/SecurityException;\n\n    .line 227\n    .line 228\n    invoke-direct {v0, v1}, Ljava/lang/SecurityException;-><init>(Ljava/lang/String;)V\n\n    .line 229\n    .line 230\n    .line 231\n    throw v0\n.end method',
+        '    :cond_9\n    return-object v2\n.end method'
+    ),
+]
+for idx, (old, new) in enumerate(patches):
+    if old in content:
+        content = content.replace(old, new, 1)
+        print(f"  Patch {idx+1}: APPLIED")
+    else:
+        print(f"  Patch {idx+1}: NOT FOUND (may differ in this version)")
+open(path, 'w').write(content)
+PYEOF
+    ok "SecurePendingIntent patched"
   else
-    # Check if patching would be needed
-    DEX_DIR="$DECOMPILED/root"
-    [ ! -d "$DEX_DIR" ] && DEX_DIR="$DECOMPILED"
-    NEEDS_PATCH=false
-    for dex_file in "$DEX_DIR"/classes*.dex; do
-      [ ! -f "$dex_file" ] && continue
-      if strings "$dex_file" 2>/dev/null | grep -q 'SecurePendingIntent'; then
-        NEEDS_PATCH=true
-        break
-      fi
-    done
-    if $NEEDS_PATCH; then
-      warn "SecurePendingIntent found but baksmali.jar/smali.jar not available"
-      warn "Download from: https://bitbucket.org/JesusFreke/smali/downloads/"
-      warn "Place baksmali.jar and smali.jar in $WORK_DIR"
+    # Generic fallback: search for SecurePendingIntent in any smali
+    SPI_FILES=$(grep -rln 'SecurePendingIntent' "$DECOMPILED/smali/" 2>/dev/null || true)
+    if [ -n "$SPI_FILES" ]; then
+      warn "SecurePendingIntent found but not in expected path (X/1Dy.smali)"
+      warn "Files: $(echo "$SPI_FILES" | tr '\n' ' ')"
+      warn "May need manual patching if clone crashes"
+    else
+      log "No SecurePendingIntent found — no smali patch needed"
     fi
   fi
 
-  # ---- REBUILD ----
+  # ---- APKTOOL.YML PATCH ----
+  if [ -f "$DECOMPILED/apktool.yml" ]; then
+    sed -i "s|packageId: ${ORIG_PKG}$|packageId: ${CLONE_PKG}|" "$DECOMPILED/apktool.yml"
+  fi
+
+  # ---- REBUILD via apktool ----
   log "Rebuilding APK..."
-  UNSIGNED="$WORK_DIR/_${CLONE_ID}-unsigned.apk"
   rm -f "$UNSIGNED"
-  java -jar "$APKEDITOR" b -i "$DECOMPILED" -o "$UNSIGNED"
+  apktool b "$DECOMPILED" -o "$UNSIGNED"
   ok "Built"
 
-  # ---- UNCOMPRESSED .so INJECTION ----
-  log "Injecting uncompressed .so files..."
-  TMPSO=$(mktemp -d)
-  unzip -o "$UNSIGNED" 'lib/*' -d "$TMPSO" 2>/dev/null || true
-  if [ -d "$TMPSO/lib" ]; then
-    cd "$TMPSO"
-    find lib -name '*.so' -exec zip -0 "$UNSIGNED" {} \; 2>/dev/null || true
+  # ---- FIX NATIVE LIB COMPRESSION ----
+  log "Fixing native lib compression..."
+  # Remove compressed .so files, re-add uncompressed
+  zip -d "$UNSIGNED" 'lib/arm64-v8a/*.so' 2>/dev/null || true
+  zip -d "$UNSIGNED" 'lib/armeabi-v7a/*.so' 2>/dev/null || true
+  if [ -d "$DECOMPILED/lib/arm64-v8a" ]; then
+    cd "$DECOMPILED"
+    find lib/arm64-v8a/ -name "*.so" | xargs zip -0 "$UNSIGNED"
+    cd "$WORK_DIR"
+  elif [ -d "$DECOMPILED/lib/armeabi-v7a" ]; then
+    cd "$DECOMPILED"
+    find lib/armeabi-v7a/ -name "*.so" | xargs zip -0 "$UNSIGNED"
     cd "$WORK_DIR"
   fi
-  rm -rf "$TMPSO"
-  ok ".so files injected"
+  ok ".so files injected uncompressed"
 
-  # ---- SIGN ----
-  log "Signing..."
-  apksigner sign --ks "$KEYSTORE" --ks-pass "pass:${KS_PASS}" \
-    --ks-key-alias "$KS_ALIAS" "$UNSIGNED" 2>/dev/null
-  mv "$UNSIGNED" "$CLONE_APK"
+  # ---- ALIGN + SIGN ----
+  log "Aligning and signing..."
+  rm -f "$ALIGNED"
+  zipalign -f 4 "$UNSIGNED" "$ALIGNED"
+  apksigner sign \
+    --ks "$KEYSTORE" \
+    --ks-key-alias "$KS_ALIAS" \
+    --ks-pass "pass:${KS_PASS}" \
+    --key-pass "pass:${KS_PASS}" \
+    --out "$CLONE_APK" \
+    "$ALIGNED"
   ok "Signed → $(basename "$CLONE_APK") ($(du -h "$CLONE_APK" | cut -f1))"
+
+  # ---- CLEANUP intermediates ----
+  rm -f "$UNSIGNED" "$ALIGNED"
 
   # ---- INSTALL ----
   if $DO_INSTALL; then
@@ -327,7 +349,7 @@ done
 
 # ---- FINAL CLEANUP ------------------------------------------
 rm -f "$MERGED_APK"
-rm -rf "$SPLITS_DIR"
+rm -rf "$BUNDLE_DIR"
 
 echo ""
 echo -e "${B}========================================${N}"
