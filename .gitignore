@@ -1,0 +1,11 @@
+work/
+output/
+*.apk
+*.xapk
+*.apkm
+*.keystore
+*.jks
+APKEditor.jar
+apktool.jar
+*Zone.Identifier
+__pycache__/
