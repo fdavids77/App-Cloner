@@ -1,25 +1,20 @@
 #!/bin/bash
-# ─────────────────────────────────────────────────────────────────────────────
-# clone-factory.sh — Universal Android App Cloner
-# Usage:
-#   ./clone-factory.sh --app whatsapp --input WhatsApp.xapk --count 6
-#   ./clone-factory.sh --app whatsapp --input WhatsApp.xapk --count 6 --install
-#   ./clone-factory.sh --app whatsapp --input WhatsApp.xapk --count 6 --install --private-space 10
-# ─────────────────────────────────────────────────────────────────────────────
+# clone-factory.sh — Universal Android App Cloner v2.1
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME=""
 INPUT_FILE=""
 CLONE_COUNT=6
 DO_INSTALL=false
 PRIVATE_SPACE_USER=""
 DRY_RUN=false
-KEYSTORE="$(dirname "$0")/my.keystore"
+KEYSTORE="$SCRIPT_DIR/my.keystore"
 KEY_ALIAS="wakey"
 KEY_PASS="yourpassword"
-WORK_DIR="$(dirname "$0")/work"
-OUTPUT_DIR="$(dirname "$0")/output"
-VERSIONS_FILE="$(dirname "$0")/versions.json"
+WORK_DIR="$SCRIPT_DIR/work"
+OUTPUT_DIR="$SCRIPT_DIR/output"
+VERSIONS_FILE="$SCRIPT_DIR/versions.json"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log()     { echo -e "${BLUE}[•]${NC} $*"; }
@@ -30,7 +25,7 @@ error()   { echo -e "${RED}[✗]${NC} $*"; exit 1; }
 while [[ $# -gt 0 ]]; do
   case $1 in
     --app)           APP_NAME="$2"; shift 2 ;;
-    --input)         INPUT_FILE="$2"; shift 2 ;;
+    --input)         INPUT_FILE="$(realpath "$2")"; shift 2 ;;
     --count)         CLONE_COUNT="$2"; shift 2 ;;
     --install)       DO_INSTALL=true; shift ;;
     --private-space) PRIVATE_SPACE_USER="$2"; shift 2 ;;
@@ -39,85 +34,58 @@ while [[ $# -gt 0 ]]; do
     --key-alias)     KEY_ALIAS="$2"; shift 2 ;;
     --key-pass)      KEY_PASS="$2"; shift 2 ;;
     --help|-h)
-      echo "Usage: $0 --app <name> --input <file.xapk|apkm|apk> --count <n> [options]"
-      echo "  --install        Install after build"
-      echo "  --private-space  Install to private space user ID"
-      echo "  --dry-run        Preview without building"
+      echo "Usage: $0 --app <name> --input <file> --count <n> [--install] [--private-space <uid>] [--dry-run]"
       exit 0 ;;
     *) error "Unknown argument: $1" ;;
   esac
 done
 
-[ -z "$APP_NAME" ]   && error "Missing --app"
-[ -z "$INPUT_FILE" ] && error "Missing --input"
+[ -z "$APP_NAME" ]     && error "Missing --app"
+[ -z "$INPUT_FILE" ]   && error "Missing --input"
 [ ! -f "$INPUT_FILE" ] && error "File not found: $INPUT_FILE"
 
-mkdir -p "$WORK_DIR/$APP_NAME" "$OUTPUT_DIR/$APP_NAME"
+BUNDLE_DIR="$WORK_DIR/$APP_NAME/bundle"
+mkdir -p "$BUNDLE_DIR" "$OUTPUT_DIR/$APP_NAME"
 
-detect_type() {
-  local ext="${1##*.}"
-  case "${ext,,}" in
-    xapk|apkm) echo "bundle" ;;
-    apk)
-      unzip -l "$1" 2>/dev/null | grep -q "base.apk" && echo "bundle" || echo "apk"
-      ;;
-    *) echo "unknown" ;;
-  esac
-}
+# ── Extract ───────────────────────────────────────────────────────────────────
+log "Extracting: $INPUT_FILE"
+rm -rf "$BUNDLE_DIR"
+mkdir -p "$BUNDLE_DIR"
+unzip -o -q "$INPUT_FILE" -d "$BUNDLE_DIR"
+APK_COUNT=$(find "$BUNDLE_DIR" -maxdepth 1 -name "*.apk" | wc -l)
+log "APKs found: $APK_COUNT"
+[ "$APK_COUNT" -eq 0 ] && cp "$INPUT_FILE" "$BUNDLE_DIR/base.apk"
 
-extract_bundle() {
-  local bundle_dir="$WORK_DIR/$APP_NAME/bundle"
-  local type
-  type=$(detect_type "$INPUT_FILE")
-  log "Input type: $type — extracting..."
-  rm -rf "$bundle_dir"; mkdir -p "$bundle_dir"
+# ── Get base APK ──────────────────────────────────────────────────────────────
+BASE_APK="$BUNDLE_DIR/base.apk"
+[ ! -f "$BASE_APK" ] && BASE_APK=$(find "$BUNDLE_DIR" -maxdepth 1 -name "*.apk" | grep -v "split_\|config\." | head -1)
+[ ! -f "$BASE_APK" ] && BASE_APK=$(find "$BUNDLE_DIR" -maxdepth 1 -name "*.apk" | head -1)
+[ -z "$BASE_APK" ] && error "No base APK found"
 
-  if [ "$type" = "bundle" ]; then
-    cp "$INPUT_FILE" "$bundle_dir/bundle.zip"
-    cd "$bundle_dir" && unzip -q bundle.zip && rm -f bundle.zip && cd - > /dev/null
-    log "Splits found: $(ls "$bundle_dir"/*.apk 2>/dev/null | wc -l)"
-  else
-    cp "$INPUT_FILE" "$bundle_dir/base.apk"
-  fi
-  echo "$bundle_dir"
-}
+# ── Detect package + version ──────────────────────────────────────────────────
+ORIG_PKG=$(aapt dump badging "$BASE_APK" 2>/dev/null | grep "^package:" | head -1 | grep -o "name='[^']*'" | head -1 | sed "s/name='//" | sed "s/'.*//")
+VERSION=$(aapt dump badging "$BASE_APK" 2>/dev/null | grep "versionName" | sed "s/.*versionName='//" | sed "s/'.*//")
+[ -z "$ORIG_PKG" ] && error "Could not detect package name from $BASE_APK"
 
-merge_splits() {
-  local bundle_dir="$1"
-  local merged="$WORK_DIR/$APP_NAME/merged.apk"
-  local apk_editor="$(dirname "$0")/APKEditor.jar"
-  local count
-  count=$(ls "$bundle_dir"/*.apk 2>/dev/null | wc -l)
+# ── Merge ─────────────────────────────────────────────────────────────────────
+MERGED_APK="$WORK_DIR/$APP_NAME/merged.apk"
+APK_EDITOR="$SCRIPT_DIR/APKEditor.jar"
+[ ! -f "$APK_EDITOR" ] && error "APKEditor.jar not found. Run prepare.sh first."
 
-  [ ! -f "$apk_editor" ] && error "APKEditor.jar not found. Run prepare.sh first."
+if [ "$APK_COUNT" -le 1 ]; then
+  log "Single APK — no merge needed"
+  cp "$BASE_APK" "$MERGED_APK"
+else
+  log "Merging $APK_COUNT splits..."
+  java -jar "$APK_EDITOR" m -i "$BUNDLE_DIR/" -o "$MERGED_APK" 2>&1 | \
+    grep -E "Merging|Saved|Error|Warning" || true
+  success "Merged: $(du -sh "$MERGED_APK" | cut -f1)"
+fi
 
-  if [ "$count" -le 1 ]; then
-    log "Single APK — skipping merge"
-    cp "$bundle_dir/base.apk" "$merged"
-  else
-    log "Merging $count splits with APKEditor..."
-    java -jar "$apk_editor" m -i "$bundle_dir/" -o "$merged" 2>&1 | \
-      grep -E "Merging|Saved|Error" || true
-    success "Merged: $(du -sh "$merged" | cut -f1)"
-  fi
-  echo "$merged"
-}
-
-get_pkg() {
-  aapt dump badging "$1" 2>/dev/null | grep "^package:" | \
-    sed "s/.*name='//" | sed "s/'.*//" || echo ""
-}
-
-get_version() {
-  aapt dump badging "$1" 2>/dev/null | grep "versionName" | \
-    sed "s/.*versionName='//" | sed "s/'.*//" || echo "unknown"
-}
-
+# ── Build clone ───────────────────────────────────────────────────────────────
 build_clone() {
-  local merged="$1"
-  local num="$2"
-  local orig="$3"
-  local new_pkg="${orig}.clone${num}"
+  local num="$1"
+  local new_pkg="${ORIG_PKG}.clone${num}"
   local clone_dir="$WORK_DIR/$APP_NAME/clone${num}"
   local unsigned="$OUTPUT_DIR/$APP_NAME/${APP_NAME}_clone${num}_unsigned.apk"
   local aligned="$OUTPUT_DIR/$APP_NAME/${APP_NAME}_clone${num}_aligned.apk"
@@ -127,30 +95,30 @@ build_clone() {
 
   log "Building clone $num → $new_pkg"
   rm -rf "$clone_dir"
-  apktool d "$merged" -o "$clone_dir" --force -q
+  apktool d "$MERGED_APK" -o "$clone_dir" --force -q
 
-  sed -i "s/package=\"${orig}\"/package=\"${new_pkg}\"/" "${clone_dir}/AndroidManifest.xml"
-  sed -i "s/android:authorities=\"${orig}\./android:authorities=\"${new_pkg}./g" "${clone_dir}/AndroidManifest.xml"
+  sed -i "s/package=\"${ORIG_PKG}\"/package=\"${new_pkg}\"/" "${clone_dir}/AndroidManifest.xml"
+  sed -i "s/android:authorities=\"${ORIG_PKG}\./android:authorities=\"${new_pkg}./g" "${clone_dir}/AndroidManifest.xml"
   sed -i 's/android:extractNativeLibs="false"/android:extractNativeLibs="true"/' "${clone_dir}/AndroidManifest.xml"
   sed -i '/com.sec.android.app.multiwindow/d' "${clone_dir}/AndroidManifest.xml"
   sed -i '/<permission /d' "${clone_dir}/AndroidManifest.xml"
   sed -i 's/android:requiredSplitTypes="[^"]*"//g' "${clone_dir}/AndroidManifest.xml"
   sed -i 's/android:splitTypes="[^"]*"//g' "${clone_dir}/AndroidManifest.xml"
-  sed -i "s/packageId: ${orig}$/packageId: ${new_pkg}/" "${clone_dir}/apktool.yml"
+  sed -i "s/packageId: ${ORIG_PKG}$/packageId: ${new_pkg}/" "${clone_dir}/apktool.yml"
 
-  local patch_file="$(dirname "$0")/patches/${APP_NAME}.py"
+  local patch_file="$SCRIPT_DIR/patches/${APP_NAME}.py"
   if [ -f "$patch_file" ]; then
     log "  Applying patches/${APP_NAME}.py..."
-    python3 "$patch_file" "$clone_dir" "$orig" "$new_pkg"
+    python3 "$patch_file" "$clone_dir" "$ORIG_PKG" "$new_pkg"
   fi
 
   apktool b "$clone_dir" -o "$unsigned" -q
 
-  if unzip -l "$unsigned" | grep -q "lib/arm64-v8a/.*\.so"; then
+  if unzip -l "$unsigned" 2>/dev/null | grep -q "lib/arm64-v8a/.*\.so"; then
     zip -d "$unsigned" "lib/arm64-v8a/*.so" 2>/dev/null || true
     cd "$clone_dir"
-    find lib/arm64-v8a/ -name "*.so" 2>/dev/null | xargs zip -0 "../${unsigned}" 2>/dev/null || true
-    cd - > /dev/null
+    find lib/arm64-v8a/ -name "*.so" 2>/dev/null | xargs zip -0 "$unsigned" 2>/dev/null || true
+    cd "$SCRIPT_DIR"
   fi
 
   zipalign -f -v 4 "$unsigned" "$aligned" > /dev/null
@@ -158,17 +126,15 @@ build_clone() {
     --ks "$KEYSTORE" --ks-key-alias "$KEY_ALIAS" \
     --ks-pass "pass:${KEY_PASS}" --key-pass "pass:${KEY_PASS}" \
     --out "$out" "$aligned" 2>/dev/null
-
   rm -f "$unsigned" "$aligned"
-  success "Clone $num done → $(du -sh "$out" | cut -f1)"
+  success "Clone $num → $(du -sh "$out" | cut -f1)"
 }
 
+# ── Install clone ─────────────────────────────────────────────────────────────
 install_clone() {
   local apk="$1"
   local num="$2"
   local pkg="${ORIG_PKG}.clone${num}"
-
-  [ "$DRY_RUN" = true ] && warn "[DRY RUN] Would install: $pkg" && return 0
 
   adb uninstall "$pkg" 2>/dev/null || true
 
@@ -176,8 +142,7 @@ install_clone() {
     local fname
     fname=$(basename "$apk")
     adb push "$apk" "/sdcard/$fname" > /dev/null 2>&1
-    adb shell su -c "cp /sdcard/$fname /data/local/tmp/$fname"
-    adb shell su -c "chmod 644 /data/local/tmp/$fname"
+    adb shell su -c "cp /sdcard/$fname /data/local/tmp/$fname && chmod 644 /data/local/tmp/$fname"
     adb shell pm install --user "$PRIVATE_SPACE_USER" "/data/local/tmp/$fname" 2>&1 | grep -q "Success" \
       && success "Clone $num → Private Space (user $PRIVATE_SPACE_USER)" \
       || warn "Clone $num install failed"
@@ -190,51 +155,24 @@ install_clone() {
   fi
 }
 
-save_version() {
-  python3 -c "
-import json
-try: data = json.load(open('$VERSIONS_FILE'))
-except: data = {}
-import datetime
-data['$APP_NAME'] = {'version': '$VERSION', 'count': $CLONE_COUNT, 'built_at': str(datetime.datetime.now())}
-json.dump(data, open('$VERSIONS_FILE', 'w'), indent=2)
-print('  Version saved: $VERSION')
-" 2>/dev/null || true
-}
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════╗"
-echo "║       Clone Factory v2.0                ║"
+echo "║       Clone Factory v2.1                ║"
 echo "╚══════════════════════════════════════════╝"
-echo "  App:    $APP_NAME"
-echo "  Input:  $INPUT_FILE"
-echo "  Clones: $CLONE_COUNT"
-[ "$DO_INSTALL" = true ] && echo "  Install: yes"
+echo "  App:     $APP_NAME"
+echo "  Package: $ORIG_PKG"
+echo "  Version: $VERSION"
+echo "  Clones:  $CLONE_COUNT"
+[ "$DO_INSTALL" = true ]    && echo "  Install: yes"
 [ -n "$PRIVATE_SPACE_USER" ] && echo "  PS User: $PRIVATE_SPACE_USER"
-[ "$DRY_RUN" = true ] && echo "  Mode: DRY RUN"
-echo ""
-
-BUNDLE_DIR=$(extract_bundle)
-BASE_APK="$BUNDLE_DIR/base.apk"
-[ ! -f "$BASE_APK" ] && BASE_APK=$(ls "$BUNDLE_DIR"/*.apk 2>/dev/null | head -1)
-[ -z "$BASE_APK" ] && error "No APK found in bundle"
-
-ORIG_PKG=$(get_pkg "$BASE_APK")
-VERSION=$(get_version "$BASE_APK")
-[ -z "$ORIG_PKG" ] && error "Could not detect package name"
-
-log "Package: $ORIG_PKG"
-log "Version: $VERSION"
-echo ""
-
-MERGED_APK=$(merge_splits "$BUNDLE_DIR")
+[ "$DRY_RUN" = true ]       && echo "  Mode:    DRY RUN"
 echo ""
 
 log "Building $CLONE_COUNT clones..."
 echo ""
 for i in $(seq 1 "$CLONE_COUNT"); do
-  build_clone "$MERGED_APK" "$i" "$ORIG_PKG"
+  build_clone "$i"
 done
 
 if [ "$DO_INSTALL" = true ]; then
@@ -250,13 +188,20 @@ if [ "$DO_INSTALL" = true ]; then
   fi
 fi
 
-save_version
+# Save version
+python3 -c "
+import json, datetime
+try: data = json.load(open('$VERSIONS_FILE'))
+except: data = {}
+data['$APP_NAME'] = {'version': '$VERSION', 'count': $CLONE_COUNT, 'built_at': str(datetime.datetime.now())}
+json.dump(data, open('$VERSIONS_FILE', 'w'), indent=2)
+" 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════╗"
-echo "║           Build Complete ✅              ║"
+echo "║         Build Complete ✅               ║"
 echo "╚══════════════════════════════════════════╝"
-echo "  App: $APP_NAME v$VERSION — $CLONE_COUNT clones"
+echo "  $APP_NAME v$VERSION — $CLONE_COUNT clones"
 echo "  Output: $OUTPUT_DIR/$APP_NAME/"
 echo ""
 ls -lh "$OUTPUT_DIR/$APP_NAME/"*_signed.apk 2>/dev/null | awk '{print "  "$NF" ("$5")"}'
