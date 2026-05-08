@@ -104,7 +104,18 @@ build_clone() {
   sed -i '/<permission /d' "${clone_dir}/AndroidManifest.xml"
   sed -i 's/android:requiredSplitTypes="[^"]*"//g' "${clone_dir}/AndroidManifest.xml"
   sed -i 's/android:splitTypes="[^"]*"//g' "${clone_dir}/AndroidManifest.xml"
+  # Strip unknown hex foregroundServiceType values (e.g. 0x800 = shortService, API 34+)
+  # apktool's bundled aapt2 rejects flag values it doesn't recognize.
+  sed -i 's/ android:foregroundServiceType="0x[0-9a-fA-F]\+"//g' "${clone_dir}/AndroidManifest.xml"
   sed -i "s/packageId: ${ORIG_PKG}$/packageId: ${new_pkg}/" "${clone_dir}/apktool.yml"
+
+  # Widen format on apktool's DUMMYVAL attrs — apktool guesses one type, but
+  # layouts/styles often use values incompatible with the guess. Listing all
+  # primitive formats lets aapt2 link without manual per-attr fixups.
+  if [ -f "${clone_dir}/res/values/attrs.xml" ]; then
+    sed -i -E 's#(<attr name="APKTOOL_DUMMYVAL_[^"]*" format=)"[^"]*"#\1"reference|color|integer|boolean|string|dimension|fraction|float"#g' \
+      "${clone_dir}/res/values/attrs.xml"
+  fi
 
   local patch_file="$SCRIPT_DIR/patches/${APP_NAME}.py"
   if [ -f "$patch_file" ]; then
