@@ -28,7 +28,7 @@ sudo apt install aapt    # faster version detection (apktool fallback otherwise)
 sudo apt install adb     # only needed with --install / --private-space
 ```
 
-[APKEditor.jar](https://github.com/nicowcow/APKEditor-Desktop/releases) must be placed in one of:
+[APKEditor.jar](https://github.com/REAndroid/APKEditor/releases) is downloaded automatically by `prepare.sh` (with integrity validation as of v2.2). If you want to install it manually, place it in one of:
 - Same directory as `clone-factory.sh`
 - `~/APKEditor.jar`
 - `~/tools/APKEditor.jar`
@@ -97,7 +97,7 @@ Only needed when input is a split APK (`.xapk`/`.apkm`/`.apks`). Not needed for 
    - Strips Samsung multiwindow library/permission declarations
 4. **Patches Smali** — auto-detects and neutralises `SecurePendingIntent` throws
 5. **Rebuilds** with `apktool b`
-6. **Injects `.so` files uncompressed** via `zip -0` (pairs with `extractNativeLibs`)
+6. **Injects `.so` files uncompressed** via `zip -0` (multi-ABI: arm64-v8a, armeabi-v7a, x86_64, x86)
 7. **Aligns and signs** with `zipalign` + `apksigner` (keystore auto-generated on first run)
 8. **Optionally installs** via ADB to main profile or Private Space
 
@@ -134,7 +134,8 @@ com.example.app)
 - Each clone gets its own registration — use a different phone number per clone
 
 ### Tinder
-- No SecurePendingIntent issues
+- No SecurePendingIntent issues — no `patches/tinder.py` needed
+- **APKMirror variant matters**: grab the **arm64-v8a** or **universal** XAPK. The default 32-bit-only build will fail with `INSTALL_FAILED_NO_MATCHING_ABIS` on any Pixel from the Pixel 7 / Tensor G2 onward (64-bit only, no 32-bit fallback). See Troubleshooting below.
 - Google Sign-In will not work on clones (OAuth client ID is bound to `com.tinder` + Tinder's release signing key) — use phone/email login
 - FaceTec liveness SDK uses native C++ — cannot be hooked via Java/Xposed
 - Add cloned package names to Magisk DenyList if on a rooted device
@@ -144,6 +145,105 @@ com.example.app)
 - First test `clone1` manually for any new app before batch-building
 - Push notifications won't work on clones (Firebase `google_app_id` is tied to original package)
 - Watch for: certificate pinning, Firebase init crashes, GMS `app_id` checks
+
+## Troubleshooting
+
+### `INSTALL_FAILED_NO_MATCHING_ABIS` (res=-113)
+
+The APK's native libraries don't match the device's CPU architecture. Almost always caused by downloading the wrong XAPK variant from APKMirror — typically grabbing the 32-bit (`armeabi-v7a`) build for a 64-bit-only Pixel (Pixel 7 and newer have dropped 32-bit support).
+
+**Diagnose in 30 seconds:**
+
+```bash
+# What ABIs are in your cloned APK?
+unzip -l output/tinder/tinder_clone1_signed.apk | awk '/lib\// {print $4}' | cut -d/ -f1-2 | sort -u
+
+# What ABIs does the device support?
+adb shell getprop ro.product.cpu.abilist
+```
+
+| First command output | Diagnosis |
+|---|---|
+| `lib/armeabi-v7a` only | Wrong XAPK variant — redownload the arm64-v8a build |
+| `lib/arm64-v8a` (or both) | APK is fine; check device ABI list above |
+| No `lib/` lines | apktool dropped libs during rebuild — open an issue with the app name |
+
+**Fix:** redownload from APKMirror, filtering for variant **arm64-v8a** or **universal**:
+
+```bash
+rm -rf work/<app> output/<app>
+./clone-factory.sh --app <app> --input <new>.xapk --count <n>
+```
+
+### `Error: Invalid or corrupt jarfile ... APKEditor.jar`
+
+`prepare.sh` was interrupted during the APKEditor download, or wget timed out and left a partial file. As of v2.2, `prepare.sh` validates the JAR with `unzip -t` and re-downloads if corrupt, and `clone-factory.sh` refuses to start without a valid JAR.
+
+**Manual fix:**
+
+```bash
+rm -f APKEditor.jar
+wget https://github.com/REAndroid/APKEditor/releases/latest/download/APKEditor.jar
+unzip -t APKEditor.jar | tail -1   # should say "No errors detected"
+ls -lh APKEditor.jar               # should be ~3–5 MB, not kilobytes
+```
+
+If wget keeps failing:
+
+```bash
+curl -L -o APKEditor.jar \
+  https://github.com/REAndroid/APKEditor/releases/latest/download/APKEditor.jar
+```
+
+### Clone factory "merges" but produces no merged.apk
+
+Pre-v2.2 bug — the merge pipeline used `... | grep -E "Error|Warning" || true`, which masked APKEditor failures because grep exited 0 whenever it matched the word "Error" in stderr. v2.2 adds `set -o pipefail` and an explicit `[ -s "$MERGED_APK" ]` post-check that fails the build immediately on empty output.
+
+If you're on an older version, the symptom looks like:
+
+```
+[•] Merging 20 splits...
+Error: Invalid or corrupt jarfile /home/.../APKEditor.jar
+du: cannot access '.../merged.apk': No such file or directory
+[✓] Merged:                              ← false success
+...
+Input file (.../merged.apk) was not found or was not readable.
+```
+
+Upgrade to v2.2 or backport these two changes to `clone-factory.sh`:
+
+```bash
+set -o pipefail                                              # near top, after set -e
+unzip -t "$APK_EDITOR" &>/dev/null || error "..."            # before java -jar
+[ -s "$MERGED_APK" ] || error "Merge produced no output..." # after java -jar
+```
+
+### `INSTALL_FAILED_DUPLICATE_PERMISSION`
+
+A previous clone of the same source app left a `<permission>` declaration on the device, and the new clone declares the same one. The manifest patcher already strips `<permission>` tags, but make sure you're on v1.2 or newer:
+
+```bash
+adb shell pm list packages | grep <original_pkg>.clone
+adb shell su -c "pm uninstall --user 10 <conflicting.pkg.cloneN>"
+```
+
+### Clone installs but crashes on launch (Tinder / WhatsApp)
+
+Most common causes, in order:
+1. **Firebase `google_app_id` mismatch** — clones can't receive push notifications and may crash if the app aggressively validates the GMS app ID. Mostly harmless beyond losing notifications.
+2. **SecurePendingIntent throws** (WhatsApp only) — should be patched automatically. Run `python3 patches/whatsapp.py --probe work/whatsapp/clone1` to confirm anchors were found.
+3. **Root detection** — add the clone package to Magisk DenyList: `Magisk app → Settings → DenyList → Configure DenyList → search for clone package`.
+4. **Certificate pinning** — affects login/network only, not launch. If you see SSL errors in `adb logcat`, the app has cert pinning and needs separate handling (out of scope for the factory).
+
+### `prepare.sh: command not found`
+
+You're missing the leading `./`. Bash won't search the current directory by default:
+
+```bash
+./prepare.sh           # ✓
+prepare.sh             # ✗ command not found
+bash prepare.sh        # ✓ alternative
+```
 
 ## Output Structure
 
@@ -167,6 +267,8 @@ com.example.app)
 
 | Version | Changes |
 |---------|---------|
+| v2.2 | **Hardening release**: `set -o pipefail` in clone-factory, APKEditor.jar integrity check via `unzip -t` in both prepare.sh and clone-factory.sh, post-merge `[ -s "$MERGED_APK" ]` guard, multi-ABI `.so` re-injection loop (arm64-v8a / armeabi-v7a / x86_64 / x86), Tinder troubleshooting docs, automatic re-download of corrupt APKEditor.jar |
+| v2.1 | apktool 3.x compatibility (DUMMYVAL format widening, foregroundServiceType hex stripping) |
 | v2.0 | Error handling (traps/rollback/resume), dry-run, parallel builds, auto-download helper, version detection, changelog logging, extensible app profiles |
 | v1.5 | WhatsApp Business support, generic SecurePendingIntent patching, merged APK reuse |
 | v1.4 | `--start`/`--count` for building specific clone ranges |

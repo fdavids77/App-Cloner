@@ -1,6 +1,14 @@
 #!/bin/bash
-# clone-factory.sh — Universal Android App Cloner v2.1
+# clone-factory.sh — Universal Android App Cloner v2.2
+#
+# v2.2 hardening:
+#   - set -o pipefail catches failures in the APKEditor merge pipeline
+#   - Validates APKEditor.jar with `unzip -t` before invoking it
+#   - Guards against silent merge failure with [ -s "$MERGED_APK" ]
+#   - Multi-ABI re-injection loop (no longer hardcoded to arm64-v8a)
+
 set -e
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME=""
@@ -70,7 +78,12 @@ VERSION=$(aapt dump badging "$BASE_APK" 2>/dev/null | grep "versionName" | sed "
 # ── Merge ─────────────────────────────────────────────────────────────────────
 MERGED_APK="$WORK_DIR/$APP_NAME/merged.apk"
 APK_EDITOR="$SCRIPT_DIR/APKEditor.jar"
+
+# v2.2: validate APKEditor.jar before invoking. wget -q in prepare.sh has historically
+# left corrupt downloads on disk; the file-exists check passes but `java -jar` fails
+# noisily mid-pipeline. unzip -t verifies the JAR is a valid zip archive.
 [ ! -f "$APK_EDITOR" ] && error "APKEditor.jar not found. Run prepare.sh first."
+unzip -t "$APK_EDITOR" &>/dev/null || error "APKEditor.jar is corrupt ($(du -h "$APK_EDITOR" | cut -f1)). Delete it and re-run prepare.sh."
 
 if [ "$APK_COUNT" -le 1 ]; then
   log "Single APK — no merge needed"
@@ -79,6 +92,9 @@ else
   log "Merging $APK_COUNT splits..."
   java -jar "$APK_EDITOR" m -i "$BUNDLE_DIR/" -o "$MERGED_APK" 2>&1 | \
     grep -E "Merging|Saved|Error|Warning" || true
+  # v2.2: even with pipefail, the grep||true above can swallow merge errors. Guard
+  # explicitly on the output file. Catches "Error: Invalid or corrupt jarfile" too.
+  [ -s "$MERGED_APK" ] || error "Merge produced no output — check APKEditor.jar and the input bundle"
   success "Merged: $(du -sh "$MERGED_APK" | cut -f1)"
 fi
 
@@ -125,12 +141,15 @@ build_clone() {
 
   apktool b "$clone_dir" -o "$unsigned" -q
 
-  if unzip -l "$unsigned" 2>/dev/null | grep -q "lib/arm64-v8a/.*\.so"; then
-    zip -d "$unsigned" "lib/arm64-v8a/*.so" 2>/dev/null || true
-    cd "$clone_dir"
-    find lib/arm64-v8a/ -name "*.so" 2>/dev/null | xargs zip -0 "$unsigned" 2>/dev/null || true
-    cd "$SCRIPT_DIR"
-  fi
+  # v2.2: re-inject native libs uncompressed for ALL present ABIs, not just arm64-v8a.
+  # Hardcoding arm64-v8a silently dropped armeabi-v7a / x86_64 libs from clones, and
+  # made debugging NO_MATCHING_ABIS install failures harder than it needed to be.
+  for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+    if [ -d "$clone_dir/lib/$abi" ] && [ -n "$(find "$clone_dir/lib/$abi" -name '*.so' -print -quit 2>/dev/null)" ]; then
+      zip -d "$unsigned" "lib/$abi/*.so" 2>/dev/null || true
+      (cd "$clone_dir" && find "lib/$abi" -name "*.so" 2>/dev/null | xargs -r zip -0 "$unsigned") 2>/dev/null || true
+    fi
+  done
 
   zipalign -f -v 4 "$unsigned" "$aligned" > /dev/null
   apksigner sign \
@@ -169,7 +188,7 @@ install_clone() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════╗"
-echo "║       Clone Factory v2.1                ║"
+echo "║       Clone Factory v2.2                ║"
 echo "╚══════════════════════════════════════════╝"
 echo "  App:     $APP_NAME"
 echo "  Package: $ORIG_PKG"
