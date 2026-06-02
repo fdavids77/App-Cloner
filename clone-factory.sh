@@ -1,5 +1,17 @@
 #!/bin/bash
-# clone-factory.sh — Universal Android App Cloner v2.2
+# clone-factory.sh — Universal Android App Cloner v2.3
+#
+# v2.3 additions:
+#   - --rewrite-string-literals: opt-in post-decompile pass that rewrites
+#     bare "com.whatsapp" const-string literals to "<orig>.cloneN" *only*
+#     where they're passed as the package arg to Intent.setPackage,
+#     Intent.setClassName, ComponentName.<init>, Context.grantUriPermission,
+#     PackageManager.clearPackagePreferredActivities, or
+#     PackageManager.getApplicationIcon. Everything else (account types,
+#     URLs, NDEF AARs, equality checks, etc.) is left alone. Fixes the EULA
+#     "Agree and Continue" SecurityException on WA 2.26.20.72+ where
+#     hardcoded setPackage("com.whatsapp") routes intents to the original
+#     app's UID. See patches/rewrite_string_literals.py for the heuristic.
 #
 # v2.2 hardening:
 #   - set -o pipefail catches failures in the APKEditor merge pipeline
@@ -17,6 +29,7 @@ CLONE_COUNT=6
 DO_INSTALL=false
 PRIVATE_SPACE_USER=""
 DRY_RUN=false
+REWRITE_STRING_LITERALS=false
 KEYSTORE="$SCRIPT_DIR/my.keystore"
 KEY_ALIAS="wakey"
 KEY_PASS="yourpassword"
@@ -38,11 +51,12 @@ while [[ $# -gt 0 ]]; do
     --install)       DO_INSTALL=true; shift ;;
     --private-space) PRIVATE_SPACE_USER="$2"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
+    --rewrite-string-literals) REWRITE_STRING_LITERALS=true; shift ;;
     --keystore)      KEYSTORE="$2"; shift 2 ;;
     --key-alias)     KEY_ALIAS="$2"; shift 2 ;;
     --key-pass)      KEY_PASS="$2"; shift 2 ;;
     --help|-h)
-      echo "Usage: $0 --app <name> --input <file> --count <n> [--install] [--private-space <uid>] [--dry-run]"
+      echo "Usage: $0 --app <name> --input <file> --count <n> [--install] [--private-space <uid>] [--dry-run] [--rewrite-string-literals]"
       exit 0 ;;
     *) error "Unknown argument: $1" ;;
   esac
@@ -139,6 +153,22 @@ build_clone() {
     python3 "$patch_file" "$clone_dir" "$ORIG_PKG" "$new_pkg"
   fi
 
+  # v2.3: opt-in const-string literal rewrite. Required as of WA 2.26.20.72
+  # for the EULA "Agree and Continue" flow, which uses Intent.setPackage with
+  # a hardcoded "com.whatsapp" literal that survives the manifest rename and
+  # routes intents to the original package's UID (SecurityException at launch).
+  # Guarded behind a flag because the rewriter is conservative-by-default but
+  # any new package-targeting API in future versions may need pattern updates.
+  if [ "$REWRITE_STRING_LITERALS" = true ]; then
+    local rewriter="$SCRIPT_DIR/patches/rewrite_string_literals.py"
+    if [ -f "$rewriter" ]; then
+      log "  Rewriting bare \"$ORIG_PKG\" const-strings → \"$new_pkg\" (targeted)..."
+      python3 "$rewriter" "$clone_dir" "$ORIG_PKG" "$new_pkg"
+    else
+      warn "  --rewrite-string-literals set but $rewriter not found; skipping"
+    fi
+  fi
+
   apktool b "$clone_dir" -o "$unsigned" -q
 
   # v2.2: re-inject native libs uncompressed for ALL present ABIs, not just arm64-v8a.
@@ -188,7 +218,7 @@ install_clone() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════╗"
-echo "║       Clone Factory v2.2                ║"
+echo "║       Clone Factory v2.3                ║"
 echo "╚══════════════════════════════════════════╝"
 echo "  App:     $APP_NAME"
 echo "  Package: $ORIG_PKG"
@@ -197,6 +227,7 @@ echo "  Clones:  $CLONE_COUNT"
 [ "$DO_INSTALL" = true ]    && echo "  Install: yes"
 [ -n "$PRIVATE_SPACE_USER" ] && echo "  PS User: $PRIVATE_SPACE_USER"
 [ "$DRY_RUN" = true ]       && echo "  Mode:    DRY RUN"
+[ "$REWRITE_STRING_LITERALS" = true ] && echo "  Smali:   targeted const-string rewrite enabled"
 echo ""
 
 log "Building $CLONE_COUNT clones..."
